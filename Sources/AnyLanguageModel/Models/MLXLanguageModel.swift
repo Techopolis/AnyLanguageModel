@@ -120,6 +120,42 @@ import Foundation
     /// Shared cache across MLXLanguageModel instances.
     private nonisolated(unsafe) let modelCache = ModelContextCache(countLimit: 3)
 
+    // MARK: - Session KV Cache Store
+
+    /// Stores a KV cache and its prefill token count for a session.
+    private final class SessionCacheEntry: NSObject, @unchecked Sendable {
+        var kvCache: [MLXLMCommon.KVCache]
+        var prefillTokenCount: Int
+
+        init(kvCache: [MLXLMCommon.KVCache], prefillTokenCount: Int) {
+            self.kvCache = kvCache
+            self.prefillTokenCount = prefillTokenCount
+        }
+    }
+
+    /// Maps LanguageModelSession (weak key) → SessionCacheEntry.
+    /// When a session is deallocated, its cache entry is automatically released.
+    private nonisolated(unsafe) let sessionKVCache = NSMapTable<AnyObject, SessionCacheEntry>.weakToStrongObjects()
+    private let sessionKVCacheLock = NSLock()
+
+    private func getSessionCache(_ session: LanguageModelSession) -> SessionCacheEntry? {
+        sessionKVCacheLock.lock()
+        defer { sessionKVCacheLock.unlock() }
+        return sessionKVCache.object(forKey: session)
+    }
+
+    private func setSessionCache(_ entry: SessionCacheEntry, for session: LanguageModelSession) {
+        sessionKVCacheLock.lock()
+        defer { sessionKVCacheLock.unlock() }
+        sessionKVCache.setObject(entry, forKey: session)
+    }
+
+    private func removeSessionCache(for session: LanguageModelSession) {
+        sessionKVCacheLock.lock()
+        defer { sessionKVCacheLock.unlock() }
+        sessionKVCache.removeObject(forKey: session)
+    }
+
     // MARK: - MLXLanguageModel
 
     /// A language model that runs locally using MLX.
@@ -228,6 +264,11 @@ import Foundation
             var allTextChunks: [String] = []
             var allEntries: [Transcript.Entry] = []
 
+            // Track the KV cache across the tool-calling loop.
+            // On the first iteration we try to reuse the session's cached KV state;
+            // on subsequent iterations (tool results added) we must rebuild.
+            var isFirstIteration = true
+
             // Loop until no more tool calls
             while true {
                 // Build user input with current chat history and tools
@@ -238,9 +279,45 @@ import Foundation
                 )
                 let lmInput = try await context.processor.prepare(input: userInput)
 
+                // Determine cache and input for generation
+                let cache: [MLXLMCommon.KVCache]
+                let inputForGeneration: MLXLMCommon.LMInput
+
+                if isFirstIteration {
+                    let existingEntry = getSessionCache(session)
+                    let fullTokenCount = lmInput.text.tokens.dim(0)
+
+                    if let existingEntry,
+                       existingEntry.prefillTokenCount > 0,
+                       fullTokenCount > existingEntry.prefillTokenCount,
+                       lmInput.image == nil
+                    {
+                        // Cache HIT: only prefill new tokens
+                        let cachedCount = existingEntry.prefillTokenCount
+                        let newTokens = lmInput.text.tokens[cachedCount...]
+                        let partialText = MLXLMCommon.LMInput.Text(tokens: newTokens)
+                        inputForGeneration = MLXLMCommon.LMInput(text: partialText)
+                        cache = existingEntry.kvCache
+                    } else {
+                        // Cache MISS: create fresh cache
+                        if existingEntry != nil {
+                            removeSessionCache(for: session)
+                        }
+                        cache = context.model.newCache(parameters: generateParameters)
+                        inputForGeneration = lmInput
+                    }
+                } else {
+                    // Tool-calling iterations: fresh cache (chat has been mutated)
+                    cache = context.model.newCache(parameters: generateParameters)
+                    inputForGeneration = lmInput
+                }
+
+                isFirstIteration = false
+
                 // Generate
                 let stream = try MLXLMCommon.generate(
-                    input: lmInput,
+                    input: inputForGeneration,
+                    cache: cache,
                     parameters: generateParameters,
                     context: context
                 )
@@ -258,6 +335,11 @@ import Foundation
                         collectedToolCalls.append(call)
                     }
                 }
+
+                // Update session cache with current offset after generation
+                let currentOffset = cache.first?.offset ?? 0
+                let cacheEntry = SessionCacheEntry(kvCache: cache, prefillTokenCount: currentOffset)
+                setSessionCache(cacheEntry, for: session)
 
                 let assistantText = chunks.joined()
                 allTextChunks.append(assistantText)
@@ -344,8 +426,37 @@ import Foundation
                         )
                         let lmInput = try await context.processor.prepare(input: userInput)
 
+                        // Check for existing KV cache for this session
+                        let existingEntry = getSessionCache(session)
+                        let cache: [MLXLMCommon.KVCache]
+                        let inputForGeneration: MLXLMCommon.LMInput
+
+                        let fullTokenCount = lmInput.text.tokens.dim(0)
+
+                        if let existingEntry,
+                           existingEntry.prefillTokenCount > 0,
+                           fullTokenCount > existingEntry.prefillTokenCount,
+                           lmInput.image == nil
+                        {
+                            // Cache HIT: only prefill new tokens
+                            let cachedCount = existingEntry.prefillTokenCount
+                            let newTokens = lmInput.text.tokens[cachedCount...]
+                            let partialText = MLXLMCommon.LMInput.Text(tokens: newTokens)
+                            inputForGeneration = MLXLMCommon.LMInput(text: partialText)
+                            cache = existingEntry.kvCache
+                        } else {
+                            // Cache MISS: create fresh cache, prefill everything
+                            if existingEntry != nil {
+                                removeSessionCache(for: session)
+                            }
+                            let newCache = context.model.newCache(parameters: generateParameters)
+                            cache = newCache
+                            inputForGeneration = lmInput
+                        }
+
                         let mlxStream = try MLXLMCommon.generate(
-                            input: lmInput,
+                            input: inputForGeneration,
+                            cache: cache,
                             parameters: generateParameters,
                             context: context
                         )
@@ -366,6 +477,11 @@ import Foundation
                             }
                         }
 
+                        // Update the session cache with current offset
+                        let currentOffset = cache.first?.offset ?? 0
+                        let entry = SessionCacheEntry(kvCache: cache, prefillTokenCount: currentOffset)
+                        setSessionCache(entry, for: session)
+
                         continuation.finish()
                     } catch {
                         continuation.finish(throwing: error)
@@ -377,7 +493,7 @@ import Foundation
             return LanguageModelSession.ResponseStream(stream: stream)
         }
 
-        /// Prewarms the model
+        /// Prewarms the model by loading it and optionally prefilling the system prompt into a KV cache.
         public func prewarm(
             for session: LanguageModelSession,
             promptPrefix: Prompt?
@@ -388,7 +504,27 @@ import Foundation
 
             Task {
                 do {
-                    _ = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+                    let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+
+                    // Prefill the system prompt into a KV cache so the first turn is faster
+                    if let instructions = session.instructions?.description, !instructions.isEmpty {
+                        let params = MLXLMCommon.GenerateParameters()
+                        let newCache = context.model.newCache(parameters: params)
+                        let chat: [MLXLMCommon.Chat.Message] = [.init(role: .system, content: instructions)]
+                        let userInput = MLXLMCommon.UserInput(
+                            chat: chat,
+                            processing: .init(resize: .init(width: 512, height: 512)),
+                            tools: nil
+                        )
+                        let lmInput = try await context.processor.prepare(input: userInput)
+                        _ = try context.model.prepare(lmInput, cache: newCache, windowSize: nil)
+
+                        let entry = SessionCacheEntry(
+                            kvCache: newCache,
+                            prefillTokenCount: newCache.first?.offset ?? 0
+                        )
+                        setSessionCache(entry, for: session)
+                    }
                 } catch {
                     // Ignore errors during prewarm
                 }
@@ -401,9 +537,9 @@ import Foundation
     private func toGenerateParameters(_ options: GenerationOptions) -> MLXLMCommon.GenerateParameters {
         MLXLMCommon.GenerateParameters(
             maxTokens: options.maximumResponseTokens,
-            maxKVSize: nil,
-            kvBits: nil,
-            kvGroupSize: 64,
+            maxKVSize: options.maxKVSize,
+            kvBits: options.kvBits,
+            kvGroupSize: options.kvGroupSize,
             quantizedKVStart: 0,
             temperature: Float(options.temperature ?? 0.6),
             topP: 1.0,

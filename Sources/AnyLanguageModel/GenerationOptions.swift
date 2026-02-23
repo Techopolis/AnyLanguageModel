@@ -121,6 +121,25 @@ public struct GenerationOptions: Sendable, Equatable, Codable {
     /// an error will be thrown.
     public var maximumResponseTokens: Int?
 
+    /// Maximum number of tokens to retain in the KV cache.
+    ///
+    /// When set, uses a rotating cache that evicts oldest tokens beyond this limit.
+    /// When `nil` (default), the cache grows unbounded.
+    ///
+    /// Recommended values: 2048–4096 for iPhone, `nil` for Mac.
+    public var maxKVSize: Int?
+
+    /// Bit width for KV cache quantization (for example, 4 or 8).
+    ///
+    /// Reduces cache memory usage at slight quality cost.
+    /// When `nil` (default), the cache uses full precision.
+    public var kvBits: Int?
+
+    /// Group size for KV cache quantization.
+    ///
+    /// Only meaningful when ``kvBits`` is set. Default is 64.
+    public var kvGroupSize: Int
+
     /// Storage for model-specific custom options.
     private var customOptionsStorage: CustomOptionsStorage = .init()
 
@@ -157,14 +176,23 @@ public struct GenerationOptions: Sendable, Equatable, Codable {
     ///     responses. Must be between `0` and `1`, inclusive.
     ///   - maximumResponseTokens: The maximum number of tokens the model is allowed
     ///     to produce before being artificially halted. Must be positive.
+    ///   - maxKVSize: Maximum tokens in the KV cache. When set, enables a rotating cache.
+    ///   - kvBits: Bit width for KV cache quantization.
+    ///   - kvGroupSize: Group size for KV cache quantization. Default is 64.
     public init(
         sampling: SamplingMode? = nil,
         temperature: Double? = nil,
-        maximumResponseTokens: Int? = nil
+        maximumResponseTokens: Int? = nil,
+        maxKVSize: Int? = nil,
+        kvBits: Int? = nil,
+        kvGroupSize: Int = 64
     ) {
         self.sampling = sampling
         self.temperature = temperature
         self.maximumResponseTokens = maximumResponseTokens
+        self.maxKVSize = maxKVSize
+        self.kvBits = kvBits
+        self.kvGroupSize = kvGroupSize
     }
 }
 
