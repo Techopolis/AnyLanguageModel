@@ -18,6 +18,135 @@ import Foundation
     import Tokenizers
     import Hub
 
+    // MARK: - GPU Memory Configuration
+
+    /// Controls Metal buffer pool behavior during and between MLX inference.
+    ///
+    /// MLX maintains a recycled buffer pool to avoid repeated Metal allocations.
+    /// This configuration sets the pool size during active inference (`activeCacheLimit`)
+    /// and between generations (`idleCacheLimit`).
+    ///
+    /// ```swift
+    /// // Automatic (scaled by device RAM):
+    /// let model = MLXLanguageModel(modelId: "...", gpuMemory: .automatic)
+    ///
+    /// // Custom:
+    /// let model = MLXLanguageModel(modelId: "...", gpuMemory: .init(
+    ///     activeCacheLimit: 256_000_000,
+    ///     idleCacheLimit: 50_000_000
+    /// ))
+    /// ```
+    public struct GPUMemoryConfiguration: Sendable, Equatable {
+        /// Maximum Metal buffer cache size in bytes during active inference.
+        public var activeCacheLimit: Int
+
+        /// Maximum Metal buffer cache size in bytes when no inference is running.
+        public var idleCacheLimit: Int
+
+        /// Whether to call `Memory.clearCache()` when a model is evicted.
+        public var clearCacheOnEviction: Bool
+
+        public init(
+            activeCacheLimit: Int,
+            idleCacheLimit: Int,
+            clearCacheOnEviction: Bool = true
+        ) {
+            self.activeCacheLimit = activeCacheLimit
+            self.idleCacheLimit = idleCacheLimit
+            self.clearCacheOnEviction = clearCacheOnEviction
+        }
+
+        /// Scaled by device RAM. Idle: 50 MB. Clear cache on eviction.
+        ///
+        /// Active limits: <4 GB → 128 MB, <6 GB → 256 MB, <8 GB → 512 MB, 8+ GB → 768 MB.
+        public static var automatic: GPUMemoryConfiguration {
+            let ramBytes = ProcessInfo.processInfo.physicalMemory
+            let ramGB = ramBytes / (1024 * 1024 * 1024)
+
+            let active: Int
+            switch ramGB {
+            case ..<4:
+                active = 128_000_000
+            case ..<6:
+                active = 256_000_000
+            case ..<8:
+                active = 512_000_000
+            default:
+                active = 768_000_000
+            }
+
+            return GPUMemoryConfiguration(
+                activeCacheLimit: active,
+                idleCacheLimit: 50_000_000,
+                clearCacheOnEviction: true
+            )
+        }
+
+        /// No management — MLX defaults, unbounded cache.
+        public static var unconstrained: GPUMemoryConfiguration {
+            GPUMemoryConfiguration(
+                activeCacheLimit: Int.max,
+                idleCacheLimit: Int.max,
+                clearCacheOnEviction: false
+            )
+        }
+    }
+
+    // MARK: - GPU Memory Manager
+
+    /// Reference-counted active/idle toggling for the global Metal buffer cache.
+    ///
+    /// Multiple sessions can generate concurrently. The cache stays at `activeCacheLimit`
+    /// as long as ANY session is generating, and drops to `idleCacheLimit` only when ALL
+    /// sessions complete.
+    private final class GPUMemoryManager: @unchecked Sendable {
+        static let shared = GPUMemoryManager()
+
+        private let lock = NSLock()
+        private var activeCount = 0
+        private var config: GPUMemoryConfiguration = .automatic
+
+        private init() {
+            Memory.cacheLimit = config.idleCacheLimit
+        }
+
+        func configure(_ configuration: GPUMemoryConfiguration) {
+            lock.withLock {
+                config = configuration
+                if activeCount == 0 {
+                    Memory.cacheLimit = configuration.idleCacheLimit
+                }
+            }
+        }
+
+        func markActive() {
+            lock.withLock {
+                if activeCount == 0 {
+                    Memory.cacheLimit = config.activeCacheLimit
+                }
+                activeCount += 1
+            }
+        }
+
+        func markIdle() {
+            lock.withLock {
+                activeCount = max(0, activeCount - 1)
+                if activeCount == 0 {
+                    Memory.cacheLimit = config.idleCacheLimit
+                }
+            }
+        }
+
+        func evict() {
+            lock.withLock {
+                Memory.cacheLimit = config.idleCacheLimit
+                if config.clearCacheOnEviction {
+                    Memory.clearCache()
+                }
+            }
+        }
+    }
+
     /// Wrapper to store ModelContext in NSCache (requires NSObject subclass).
     private final class CachedContext: NSObject, @unchecked Sendable {
         let context: ModelContext
@@ -180,16 +309,22 @@ import Foundation
         /// The local directory containing the model files.
         public let directory: URL?
 
+        /// GPU memory management configuration for Metal buffer pools.
+        public let gpuMemory: GPUMemoryConfiguration
+
         /// Creates an MLX language model.
         ///
         /// - Parameters:
         ///   - modelId: The model identifier (for example, "mlx-community/Llama-3.2-3B-Instruct-4bit").
         ///   - hub: An optional Hub API instance for downloading models. If not provided, the default Hub API is used.
         ///   - directory: An optional local directory URL containing the model files. If provided, the model is loaded from this directory instead of downloading.
-        public init(modelId: String, hub: HubApi? = nil, directory: URL? = nil) {
+        ///   - gpuMemory: GPU memory configuration. Defaults to `.automatic` which scales by device RAM.
+        public init(modelId: String, hub: HubApi? = nil, directory: URL? = nil, gpuMemory: GPUMemoryConfiguration = .automatic) {
             self.modelId = modelId
             self.hub = hub
             self.directory = directory
+            self.gpuMemory = gpuMemory
+            GPUMemoryManager.shared.configure(gpuMemory)
         }
 
         /// Removes this model from the shared cache and cancels any in-flight load.
@@ -199,11 +334,13 @@ import Foundation
         public func removeFromCache() async {
             let key = directory?.absoluteString ?? modelId
             await modelCache.removeAndCancel(for: key)
+            GPUMemoryManager.shared.evict()
         }
 
         /// Removes all MLX models from the shared cache and cancels in-flight loads.
         public static func removeAllFromCache() async {
             await modelCache.removeAllAndCancel()
+            GPUMemoryManager.shared.evict()
         }
 
         /// Get or load model context with caching
@@ -228,6 +365,9 @@ import Foundation
         ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
             // Get cached or load fresh ModelContext
             let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+
+            GPUMemoryManager.shared.markActive()
+            defer { GPUMemoryManager.shared.markIdle() }
 
             if type != String.self {
                 let jsonString = try await generateStructuredJSON(
@@ -410,6 +550,9 @@ import Foundation
 
             let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
                 continuation in
+                let didMarkIdle = Locked(false)
+                GPUMemoryManager.shared.markActive()
+
                 let task = Task { @Sendable in
                     do {
                         // Get cached or load fresh ModelContext
@@ -482,12 +625,23 @@ import Foundation
                         let entry = SessionCacheEntry(kvCache: cache, prefillTokenCount: currentOffset)
                         setSessionCache(entry, for: session)
 
+                        didMarkIdle.withLock { done in
+                            if !done { GPUMemoryManager.shared.markIdle(); done = true }
+                        }
                         continuation.finish()
                     } catch {
+                        didMarkIdle.withLock { done in
+                            if !done { GPUMemoryManager.shared.markIdle(); done = true }
+                        }
                         continuation.finish(throwing: error)
                     }
                 }
-                continuation.onTermination = { _ in task.cancel() }
+                continuation.onTermination = { _ in
+                    didMarkIdle.withLock { done in
+                        if !done { GPUMemoryManager.shared.markIdle(); done = true }
+                    }
+                    task.cancel()
+                }
             }
 
             return LanguageModelSession.ResponseStream(stream: stream)
@@ -503,6 +657,9 @@ import Foundation
             let directory = self.directory
 
             Task {
+                GPUMemoryManager.shared.markActive()
+                defer { GPUMemoryManager.shared.markIdle() }
+
                 do {
                     let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
 

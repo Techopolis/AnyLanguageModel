@@ -33,8 +33,9 @@ let package = Package(
         .package(url: "https://github.com/mattt/JSONSchema", from: "1.3.0"),
         .package(url: "https://github.com/mattt/llama.swift", .upToNextMajor(from: "2.7484.0")),
         .package(url: "https://github.com/mattt/PartialJSONDecoder", from: "1.0.0"),
-        // mlx-swift-lm must be >= 2.25.5 for ToolSpec/tool calls and UserInput(chat:processing:tools:).
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "2.25.5"),
+        // mlx-swift-lm >= 2.30.3 for fast SDPA, Gemma3n per-layer intermediate_size,
+        // cache race fix, Memory API, and chat rehydration. >= 2.25.5 for ToolSpec/tool calls.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "2.30.3"),
         .package(url: "https://github.com/swiftlang/swift-syntax", from: "600.0.0"),
     ],
     targets: [
