@@ -14,7 +14,8 @@ public protocol LanguageModel: Sendable {
 
     func prewarm(
         for session: LanguageModelSession,
-        promptPrefix: Prompt?
+        promptPrefix: Prompt?,
+        tools: [any Tool]?
     )
 
     func respond<Content>(
@@ -54,7 +55,8 @@ extension LanguageModel {
 
     public func prewarm(
         for session: LanguageModelSession,
-        promptPrefix: Prompt? = nil
+        promptPrefix: Prompt? = nil,
+        tools: [any Tool]? = nil
     ) {
         return
     }
