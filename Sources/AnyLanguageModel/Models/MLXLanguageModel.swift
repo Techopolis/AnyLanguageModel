@@ -479,8 +479,18 @@ import Foundation
             // on subsequent iterations (tool results added) we must rebuild.
             var isFirstIteration = true
 
+            // Guard against infinite tool-call loops (e.g. model keeps retrying the
+            // same tool call). After this many iterations, break and return whatever
+            // text has been accumulated.
+            let maxToolIterations = 5
+            var toolIteration = 0
+
             // Loop until no more tool calls
             while true {
+                toolIteration += 1
+                if toolIteration > maxToolIterations {
+                    break
+                }
                 // Build user input with current chat history and tools
                 let userInput = MLXLMCommon.UserInput(
                     chat: chat,
@@ -552,7 +562,6 @@ import Foundation
                 setSessionCache(cacheEntry, for: session)
 
                 let assistantText = chunks.joined()
-                allTextChunks.append(assistantText)
 
                 // Add assistant response to chat history
                 if !assistantText.isEmpty {
@@ -561,6 +570,17 @@ import Foundation
 
                 // If there are tool calls, execute them and continue
                 if !collectedToolCalls.isEmpty {
+                    // Record the assistant text generated before the tool call
+                    // as a transcript entry so convertTranscriptToMLXChat() can
+                    // reproduce the exact same chat sequence on future turns
+                    // (keeping the KV cache valid).
+                    if !assistantText.isEmpty {
+                        allEntries.append(.response(Transcript.Response(
+                            assetIDs: [],
+                            segments: [.text(.init(content: assistantText))]
+                        )))
+                    }
+
                     let resolution = try await resolveToolCalls(collectedToolCalls, session: session)
                     switch resolution {
                     case .stop(let calls):
@@ -576,13 +596,20 @@ import Foundation
                         if !invocations.isEmpty {
                             allEntries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
 
-                            // Execute each tool and add results to chat
+                            // Execute each tool and fold results into the
+                            // preceding assistant message to maintain strict
+                            // user/assistant alternation for templates like Gemma 3.
+                            var toolResults: [String] = []
                             for invocation in invocations {
                                 allEntries.append(.toolOutput(invocation.output))
-
-                                // Convert tool output to JSON string for MLX
-                                let toolResultJSON = toolOutputToJSON(invocation.output)
-                                chat.append(.tool(toolResultJSON))
+                                toolResults.append(toolOutputToJSON(invocation.output))
+                            }
+                            let combinedResults = toolResults.joined(separator: "\n")
+                            if let lastIdx = chat.indices.last, chat[lastIdx].role == .assistant {
+                                let existing = chat[lastIdx].content
+                                chat[lastIdx] = .assistant(existing + "\n\n[Tool result]: " + combinedResults)
+                            } else {
+                                chat.append(.assistant("[Tool result]: " + combinedResults))
                             }
 
                             // Continue loop to generate with tool results
@@ -591,11 +618,13 @@ import Foundation
                     }
                 }
 
-                // No more tool calls, exit loop
+                // No more tool calls — this is the final response text
+                allTextChunks.append(assistantText)
                 break
             }
 
             let text = allTextChunks.joined()
+
             return LanguageModelSession.Response(
                 content: text as! Content,
                 rawContent: GeneratedContent(text),
@@ -812,7 +841,10 @@ import Foundation
             chat.append(.init(role: .system, content: instructions))
         }
 
-        // Convert each transcript entry
+        // Convert each transcript entry.
+        // Tool call/output entries are folded into adjacent assistant messages
+        // to maintain strict user/assistant alternation required by some templates
+        // (e.g. Gemma 3 which has no tool role support in its Jinja template).
         for entry in session.transcript {
             switch entry {
             case .instructions(let instr):
@@ -826,12 +858,23 @@ import Foundation
                 chat.append(.assistant(content))
 
             case .toolCalls:
-                // Tool calls are handled inline during generation loop
+                // Skip — tool calls were already executed; the output is captured below
                 break
 
             case .toolOutput(let toolOutput):
-                let content = toolOutput.segments.map { extractText(from: $0) }.joined(separator: "\n")
-                chat.append(.tool(content))
+                // Fold tool output into the preceding assistant message to avoid
+                // injecting a .tool() role that breaks strict-alternation templates.
+                // Use toolOutputToJSON() — the same function used in the live tool
+                // loop — so the replayed chat produces identical tokens, keeping
+                // the KV cache valid for session continuation.
+                let content = toolOutputToJSON(toolOutput)
+                if let lastIdx = chat.indices.last, chat[lastIdx].role == .assistant {
+                    let existing = chat[lastIdx].content
+                    chat[lastIdx] = .assistant(existing + "\n\n[Tool result]: " + content)
+                } else {
+                    // No preceding assistant message — wrap as assistant
+                    chat.append(.assistant("[Tool result]: " + content))
+                }
             }
         }
 
@@ -947,7 +990,7 @@ import Foundation
     }
 
     private func convertToSendableJSONValue(_ value: Any) throws -> any Sendable {
-        if value is NSNull { return MLXLMCommon.JSONValue.null }
+        if value is NSNull { return NSNull() }
         if let stringValue = value as? String { return stringValue }
         if let boolValue = value as? Bool { return boolValue }
         if let intValue = value as? Int { return intValue }
@@ -956,7 +999,7 @@ import Foundation
             return numberValue.doubleValue
         }
         if let arrayValue = value as? [Any] {
-            return try arrayValue.map { try convertToSendableJSONValue($0) }
+            return try arrayValue.map { try convertToSendableJSONValue($0) } as [any Sendable]
         }
         if let dictionaryValue = value as? [String: Any] {
             return try convertToSendableJSONObject(dictionaryValue)
