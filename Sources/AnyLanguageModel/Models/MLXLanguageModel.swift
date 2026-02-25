@@ -462,6 +462,9 @@ import Foundation
         /// Removes all MLX models from the shared cache and cancels in-flight loads.
         public static func removeAllFromCache() async {
             await modelCache.removeAllAndCancel()
+            sessionKVCacheLock.lock()
+            sessionKVCache.removeAllObjects()
+            sessionKVCacheLock.unlock()
             GPUMemoryManager.shared.evict()
         }
 
@@ -530,6 +533,13 @@ import Foundation
             // On the first iteration we try to reuse the session's cached KV state;
             // on subsequent iterations (tool results added) we must rebuild.
             var isFirstIteration = true
+
+            // Guard against infinite tool-call loops (e.g. model keeps retrying the
+            // same tool call). After this many iterations, break and return whatever
+            // text has been accumulated.
+            let maxToolIterations = 5
+            var toolIteration = 0
+            var previousToolCallSignature: String?
 
             // Loop until no more tool calls
             while true {
@@ -603,6 +613,29 @@ import Foundation
 
                 // If there are tool calls, execute them and continue
                 if !collectedToolCalls.isEmpty {
+                    // Detect repeated tool calls — if the model generates the exact
+                    // same tool call(s) as the previous iteration, it's stuck in a
+                    // loop. Break and return whatever text we have so far.
+                    let signature = collectedToolCalls
+                        .map { "\($0.function.name):\($0.function.arguments)" }
+                        .joined(separator: "|")
+                    if signature == previousToolCallSignature {
+                        allTextChunks.append(assistantText)
+                        break
+                    }
+                    previousToolCallSignature = signature
+
+                    // Record the assistant text generated before the tool call
+                    // as a transcript entry so convertTranscriptToMLXChat() can
+                    // reproduce the exact same chat sequence on future turns
+                    // (keeping the KV cache valid).
+                    if !assistantText.isEmpty {
+                        allEntries.append(.response(Transcript.Response(
+                            assetIDs: [],
+                            segments: [.text(.init(content: assistantText))]
+                        )))
+                    }
+
                     let resolution = try await resolveToolCalls(collectedToolCalls, session: session)
                     switch resolution {
                     case .stop(let calls):
