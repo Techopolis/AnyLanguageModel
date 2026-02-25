@@ -98,7 +98,7 @@ public final class LanguageModelSession: @unchecked Sendable {
     }
 
     public func prewarm(promptPrefix: Prompt? = nil) {
-        model.prewarm(for: self, promptPrefix: promptPrefix)
+        model.prewarm(for: self, promptPrefix: promptPrefix, tools: tools.isEmpty ? nil : tools)
     }
 
     nonisolated private func beginResponding() {

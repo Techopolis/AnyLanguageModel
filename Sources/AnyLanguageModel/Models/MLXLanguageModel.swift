@@ -105,13 +105,21 @@ import Foundation
         private let lock = NSLock()
         private var activeCount = 0
         private var config: GPUMemoryConfiguration = .automatic
+        private var hasCustomConfig = false
 
         private init() {
             Memory.cacheLimit = config.idleCacheLimit
         }
 
+        /// Applies a GPU memory configuration. First custom configuration wins —
+        /// subsequent calls with a different configuration are ignored to prevent
+        /// multiple MLXLanguageModel instances from silently overwriting each other.
         func configure(_ configuration: GPUMemoryConfiguration) {
             lock.withLock {
+                if hasCustomConfig && config != configuration {
+                    return
+                }
+                hasCustomConfig = true
                 config = configuration
                 if activeCount == 0 {
                     Memory.cacheLimit = configuration.idleCacheLimit
@@ -307,10 +315,12 @@ import Foundation
     private final class SessionCacheEntry: NSObject, @unchecked Sendable {
         var kvCache: [MLXLMCommon.KVCache]
         var prefillTokenCount: Int
+        var prefillTokenHash: Int
 
-        init(kvCache: [MLXLMCommon.KVCache], prefillTokenCount: Int) {
+        init(kvCache: [MLXLMCommon.KVCache], prefillTokenCount: Int, prefillTokenHash: Int) {
             self.kvCache = kvCache
             self.prefillTokenCount = prefillTokenCount
+            self.prefillTokenHash = prefillTokenHash
         }
     }
 
@@ -335,6 +345,48 @@ import Foundation
         sessionKVCacheLock.lock()
         defer { sessionKVCacheLock.unlock() }
         sessionKVCache.removeObject(forKey: session)
+    }
+
+    /// Hashes up to the first `count` tokens of an MLXArray for cache identity checks.
+    private func hashTokenPrefix(_ tokens: MLXArray, count: Int = 64) -> Int {
+        let tokenCount = tokens.dim(0)
+        let n = min(count, tokenCount)
+        guard n > 0 else { return 0 }
+        let prefix = tokens[0..<n]
+        let values: [Int32] = prefix.asArray(Int32.self)
+        var hasher = Hasher()
+        for v in values { hasher.combine(v) }
+        return hasher.finalize()
+    }
+
+    /// Resolves KV cache state for a session, returning either a cache hit (partial input) or a fresh cache.
+    private func resolveCache(
+        for session: LanguageModelSession,
+        lmInput: MLXLMCommon.LMInput,
+        generateParameters: MLXLMCommon.GenerateParameters,
+        context: ModelContext
+    ) -> (cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput) {
+        let existingEntry = getSessionCache(session)
+        let fullTokenCount = lmInput.text.tokens.dim(0)
+        let currentHash = hashTokenPrefix(lmInput.text.tokens)
+
+        if let existingEntry,
+           existingEntry.prefillTokenCount > 0,
+           fullTokenCount > existingEntry.prefillTokenCount,
+           existingEntry.prefillTokenHash == currentHash,
+           lmInput.image == nil
+        {
+            let cachedCount = existingEntry.prefillTokenCount
+            let newTokens = lmInput.text.tokens[cachedCount...]
+            let partialText = MLXLMCommon.LMInput.Text(tokens: newTokens)
+            return (cache: existingEntry.kvCache, input: MLXLMCommon.LMInput(text: partialText))
+        }
+
+        if existingEntry != nil {
+            removeSessionCache(for: session)
+        }
+        let freshCache = context.model.newCache(parameters: generateParameters)
+        return (cache: freshCache, input: lmInput)
     }
 
     // MARK: - MLXLanguageModel
@@ -410,6 +462,9 @@ import Foundation
         /// Removes all MLX models from the shared cache and cancels in-flight loads.
         public static func removeAllFromCache() async {
             await modelCache.removeAllAndCancel()
+            sessionKVCacheLock.lock()
+            sessionKVCache.removeAllObjects()
+            sessionKVCacheLock.unlock()
             GPUMemoryManager.shared.evict()
         }
 
@@ -484,6 +539,7 @@ import Foundation
             // text has been accumulated.
             let maxToolIterations = 5
             var toolIteration = 0
+            var previousToolCallSignature: String?
 
             // Loop until no more tool calls
             while true {
@@ -504,28 +560,14 @@ import Foundation
                 let inputForGeneration: MLXLMCommon.LMInput
 
                 if isFirstIteration {
-                    let existingEntry = getSessionCache(session)
-                    let fullTokenCount = lmInput.text.tokens.dim(0)
-
-                    if let existingEntry,
-                       existingEntry.prefillTokenCount > 0,
-                       fullTokenCount > existingEntry.prefillTokenCount,
-                       lmInput.image == nil
-                    {
-                        // Cache HIT: only prefill new tokens
-                        let cachedCount = existingEntry.prefillTokenCount
-                        let newTokens = lmInput.text.tokens[cachedCount...]
-                        let partialText = MLXLMCommon.LMInput.Text(tokens: newTokens)
-                        inputForGeneration = MLXLMCommon.LMInput(text: partialText)
-                        cache = existingEntry.kvCache
-                    } else {
-                        // Cache MISS: create fresh cache
-                        if existingEntry != nil {
-                            removeSessionCache(for: session)
-                        }
-                        cache = context.model.newCache(parameters: generateParameters)
-                        inputForGeneration = lmInput
-                    }
+                    let resolved = resolveCache(
+                        for: session,
+                        lmInput: lmInput,
+                        generateParameters: generateParameters,
+                        context: context
+                    )
+                    cache = resolved.cache
+                    inputForGeneration = resolved.input
                 } else {
                     // Tool-calling iterations: fresh cache (chat has been mutated)
                     cache = context.model.newCache(parameters: generateParameters)
@@ -558,7 +600,11 @@ import Foundation
 
                 // Update session cache with current offset after generation
                 let currentOffset = cache.first?.offset ?? 0
-                let cacheEntry = SessionCacheEntry(kvCache: cache, prefillTokenCount: currentOffset)
+                let cacheEntry = SessionCacheEntry(
+                    kvCache: cache,
+                    prefillTokenCount: currentOffset,
+                    prefillTokenHash: hashTokenPrefix(lmInput.text.tokens)
+                )
                 setSessionCache(cacheEntry, for: session)
 
                 let assistantText = chunks.joined()
@@ -570,6 +616,18 @@ import Foundation
 
                 // If there are tool calls, execute them and continue
                 if !collectedToolCalls.isEmpty {
+                    // Detect repeated tool calls — if the model generates the exact
+                    // same tool call(s) as the previous iteration, it's stuck in a
+                    // loop. Break and return whatever text we have so far.
+                    let signature = collectedToolCalls
+                        .map { "\($0.function.name):\($0.function.arguments)" }
+                        .joined(separator: "|")
+                    if signature == previousToolCallSignature {
+                        allTextChunks.append(assistantText)
+                        break
+                    }
+                    previousToolCallSignature = signature
+
                     // Record the assistant text generated before the tool call
                     // as a transcript entry so convertTranscriptToMLXChat() can
                     // reproduce the exact same chat sequence on future turns
@@ -668,33 +726,15 @@ import Foundation
                         )
                         let lmInput = try await context.processor.prepare(input: userInput)
 
-                        // Check for existing KV cache for this session
-                        let existingEntry = getSessionCache(session)
-                        let cache: [MLXLMCommon.KVCache]
-                        let inputForGeneration: MLXLMCommon.LMInput
-
-                        let fullTokenCount = lmInput.text.tokens.dim(0)
-
-                        if let existingEntry,
-                           existingEntry.prefillTokenCount > 0,
-                           fullTokenCount > existingEntry.prefillTokenCount,
-                           lmInput.image == nil
-                        {
-                            // Cache HIT: only prefill new tokens
-                            let cachedCount = existingEntry.prefillTokenCount
-                            let newTokens = lmInput.text.tokens[cachedCount...]
-                            let partialText = MLXLMCommon.LMInput.Text(tokens: newTokens)
-                            inputForGeneration = MLXLMCommon.LMInput(text: partialText)
-                            cache = existingEntry.kvCache
-                        } else {
-                            // Cache MISS: create fresh cache, prefill everything
-                            if existingEntry != nil {
-                                removeSessionCache(for: session)
-                            }
-                            let newCache = context.model.newCache(parameters: generateParameters)
-                            cache = newCache
-                            inputForGeneration = lmInput
-                        }
+                        // Resolve KV cache for this session
+                        let resolved = resolveCache(
+                            for: session,
+                            lmInput: lmInput,
+                            generateParameters: generateParameters,
+                            context: context
+                        )
+                        let cache = resolved.cache
+                        let inputForGeneration = resolved.input
 
                         let mlxStream = try MLXLMCommon.generate(
                             input: inputForGeneration,
@@ -721,7 +761,11 @@ import Foundation
 
                         // Update the session cache with current offset
                         let currentOffset = cache.first?.offset ?? 0
-                        let entry = SessionCacheEntry(kvCache: cache, prefillTokenCount: currentOffset)
+                        let entry = SessionCacheEntry(
+                            kvCache: cache,
+                            prefillTokenCount: currentOffset,
+                            prefillTokenHash: hashTokenPrefix(lmInput.text.tokens)
+                        )
                         setSessionCache(entry, for: session)
 
                         didMarkIdle.withLock { done in
@@ -747,9 +791,17 @@ import Foundation
         }
 
         /// Prewarms the model by loading it and optionally prefilling the system prompt into a KV cache.
+        ///
+        /// - Parameters:
+        ///   - session: The session whose instructions will be prefilled.
+        ///   - promptPrefix: An optional prompt prefix (reserved for future use).
+        ///   - tools: Tools that will be used with this session. Pass the same tools here
+        ///     so the prefilled cache includes tool definitions in its tokenization,
+        ///     avoiding a cache miss on the first real request.
         public func prewarm(
             for session: LanguageModelSession,
-            promptPrefix: Prompt?
+            promptPrefix: Prompt?,
+            tools: [any Tool]? = nil
         ) {
             let modelId = self.modelId
             let hub = self.hub
@@ -767,17 +819,25 @@ import Foundation
                         let params = MLXLMCommon.GenerateParameters()
                         let newCache = context.model.newCache(parameters: params)
                         let chat: [MLXLMCommon.Chat.Message] = [.init(role: .system, content: instructions)]
+
+                        // Convert tools to MLX ToolSpec format so the prefill tokenization
+                        // matches what respond() will produce, ensuring cache hits.
+                        let toolSpecs: [ToolSpec]? = tools.flatMap { toolList in
+                            toolList.isEmpty ? nil : toolList.map { convertToolToMLXSpec($0) }
+                        }
+
                         let userInput = MLXLMCommon.UserInput(
                             chat: chat,
                             processing: .init(resize: .init(width: 512, height: 512)),
-                            tools: nil
+                            tools: toolSpecs
                         )
                         let lmInput = try await context.processor.prepare(input: userInput)
                         _ = try context.model.prepare(lmInput, cache: newCache, windowSize: nil)
 
                         let entry = SessionCacheEntry(
                             kvCache: newCache,
-                            prefillTokenCount: newCache.first?.offset ?? 0
+                            prefillTokenCount: newCache.first?.offset ?? 0,
+                            prefillTokenHash: hashTokenPrefix(lmInput.text.tokens)
                         )
                         setSessionCache(entry, for: session)
                     }
