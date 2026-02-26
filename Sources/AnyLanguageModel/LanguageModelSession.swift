@@ -914,6 +914,58 @@ private enum ResponseStreamError: Error {
     case noSnapshots
 }
 
+// MARK: - Transcript Snapshot and Replacement
+
+extension LanguageModelSession {
+    /// An error that occurs when attempting to replace a transcript.
+    public enum TranscriptError: Error {
+        /// The session is currently generating a response.
+        case respondingInProgress
+    }
+
+    /// Captures the current transcript for later restoration.
+    ///
+    /// It is safe to call this while the session is responding, but the
+    /// returned transcript may include a prompt entry without a corresponding
+    /// response. For deterministic snapshots, call this when ``isResponding``
+    /// is `false`.
+    nonisolated public func snapshotTranscript() -> Transcript {
+        state.withLock { $0.transcript }
+    }
+
+    /// Replaces the session's transcript and invalidates any associated
+    /// backend cache (for example, the MLX KV cache).
+    ///
+    /// Use this to temporarily swap a session's context for a different
+    /// task (such as running a tool agent), then restore the original
+    /// transcript afterward. The next call to ``respond(to:options:)``
+    /// will rebuild any caches from the new transcript.
+    ///
+    /// - Parameter transcript: The transcript to install.
+    /// - Throws: ``TranscriptError/respondingInProgress`` if the session
+    ///   is currently generating a response.
+    nonisolated public func replaceTranscript(_ transcript: Transcript) throws {
+        // Atomic check-and-mutate: verify not responding and swap transcript
+        // in a single lock acquisition to prevent TOCTOU races.
+        let didReplace: Bool = state.withLock { lockedState in
+            guard !lockedState.isResponding else { return false }
+            lockedState.transcript = transcript
+            return true
+        }
+
+        guard didReplace else {
+            throw TranscriptError.respondingInProgress
+        }
+
+        // Notify observation after releasing the lock
+        withMutation(keyPath: \.transcript) {}
+
+        // Invalidate backend caches (e.g. MLX KV cache) outside the lock
+        // to avoid lock inversion if the model calls back into the session.
+        model.invalidateCache(for: self)
+    }
+}
+
 // MARK: -
 
 private struct State: Equatable, Sendable {

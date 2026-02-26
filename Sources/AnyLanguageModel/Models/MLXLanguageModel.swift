@@ -468,6 +468,10 @@ import Foundation
             GPUMemoryManager.shared.evict()
         }
 
+        public func invalidateCache(for session: LanguageModelSession) {
+            removeSessionCache(for: session)
+        }
+
         /// Get or load model context with caching
         private func loadContext(modelId: String, hub: HubApi?, directory: URL?) async throws -> ModelContext {
             let key = directory?.absoluteString ?? modelId

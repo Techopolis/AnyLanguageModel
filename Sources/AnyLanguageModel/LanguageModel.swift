@@ -40,6 +40,13 @@ public protocol LanguageModel: Sendable {
         issues: [LanguageModelFeedback.Issue],
         desiredOutput: Transcript.Entry?
     ) -> Data
+
+    /// Invalidates any cached state associated with the given session.
+    ///
+    /// Called when a session's transcript is replaced. Models that maintain
+    /// per-session caches (such as MLX KV caches) should evict the entry
+    /// for the given session. The default implementation does nothing.
+    func invalidateCache(for session: LanguageModelSession)
 }
 
 // MARK: - Default Implementation
@@ -69,6 +76,8 @@ extension LanguageModel {
     ) -> Data {
         return Data()
     }
+
+    public func invalidateCache(for session: LanguageModelSession) {}
 }
 
 extension LanguageModel where UnavailableReason == Never {
