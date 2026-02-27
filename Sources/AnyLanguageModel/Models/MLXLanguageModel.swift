@@ -17,6 +17,7 @@ import Foundation
     import MLXVLM
     import Tokenizers
     import Hub
+    import Observation
 
     // MARK: - GPU Memory Configuration
 
@@ -481,7 +482,18 @@ import Foundation
                     return try await loadModel(directory: directory)
                 }
 
-                return try await loadModel(hub: hub ?? HubApi(), id: modelId)
+                let effectiveHub = hub ?? HubApi()
+                let context = try await loadModel(hub: effectiveHub, id: modelId) { progress in
+                    let dp = DownloadProgress(
+                        fractionCompleted: progress.fractionCompleted,
+                        completedBytes: progress.completedUnitCount,
+                        totalBytes: progress.totalUnitCount > 0 ? progress.totalUnitCount : nil,
+                        bytesPerSecond: progress.userInfo[.throughputKey] as? Double
+                    )
+                    MLXModelDownloadManager.shared.updateState(for: modelId, to: .downloading(dp))
+                }
+                MLXModelDownloadManager.shared.updateState(for: modelId, to: .downloaded)
+                return context
             }
         }
 
@@ -1520,4 +1532,225 @@ import Foundation
             return sampledToken.item(Int.self)
         }
     }
+
+    // MARK: - MLXModelDownloadManager
+
+    /// Manages download state for MLX models.
+    ///
+    /// `@Observable` class (not actor) for direct SwiftUI binding. Thread safety
+    /// is provided by `Locked<>` for the state dictionary.
+    @Observable
+    public final class MLXModelDownloadManager: @unchecked Sendable {
+        public static let shared = MLXModelDownloadManager()
+
+        /// Current download state per model ID.
+        public private(set) var states: [String: ModelDownloadState] = [:]
+
+        /// In-flight download tasks, keyed by model ID.
+        private let inFlightDownloads = Locked<[String: Task<Void, Never>]>([:])
+
+        /// Lock for thread-safe state mutations that trigger @Observable updates.
+        private let stateLock = NSLock()
+
+        private init() {}
+
+        // MARK: - State Queries
+
+        /// Returns the current download state for a model.
+        ///
+        /// On first access for a given model, checks disk for existing files.
+        public func state(for modelId: String, hub: HubApi = HubApi()) -> ModelDownloadState {
+            stateLock.lock()
+            if let cached = states[modelId] {
+                stateLock.unlock()
+                return cached
+            }
+            stateLock.unlock()
+
+            // Check disk
+            let repo = Hub.Repo(id: modelId)
+            let repoDir = hub.localRepoLocation(repo)
+            let configPath = repoDir.appendingPathComponent("config.json")
+
+            let isOnDisk = FileManager.default.fileExists(atPath: configPath.path)
+            let state: ModelDownloadState = isOnDisk ? .downloaded : .notDownloaded
+
+            stateLock.lock()
+            // Don't overwrite an in-progress download
+            if states[modelId] == nil {
+                withMutation(keyPath: \.states) {
+                    states[modelId] = state
+                }
+            }
+            stateLock.unlock()
+
+            return states[modelId] ?? state
+        }
+
+        /// Updates the download state for a model. Called from download handlers.
+        public func updateState(for modelId: String, to newState: ModelDownloadState) {
+            stateLock.lock()
+            withMutation(keyPath: \.states) {
+                states[modelId] = newState
+            }
+            stateLock.unlock()
+        }
+
+        /// Clears cached state for a model, forcing a fresh disk check on next access.
+        public func invalidateState(for modelId: String) {
+            stateLock.lock()
+            withMutation(keyPath: \.states) {
+                states[modelId] = nil
+            }
+            stateLock.unlock()
+        }
+
+        // MARK: - Download
+
+        /// Downloads a model and returns a stream of progress updates.
+        ///
+        /// If the model is already downloaded, the stream completes immediately.
+        /// Cancelling the consuming `Task` cancels the download (snapshot checks
+        /// `Task.isCancelled` between files).
+        public func download(modelId: String, hub: HubApi = HubApi()) -> AsyncStream<DownloadProgress> {
+            let currentState = state(for: modelId, hub: hub)
+            if case .downloaded = currentState {
+                return AsyncStream { $0.finish() }
+            }
+
+            return AsyncStream { continuation in
+                let task = Task { [weak self] in
+                    guard let self else {
+                        continuation.finish()
+                        return
+                    }
+                    do {
+                        let repo = Hub.Repo(id: modelId)
+                        try await hub.snapshot(
+                            from: repo,
+                            matching: ["*.safetensors", "*.json", "tokenizer.model"]
+                        ) { progress, speed in
+                            let dp = DownloadProgress(
+                                fractionCompleted: progress.fractionCompleted,
+                                completedBytes: progress.completedUnitCount,
+                                totalBytes: progress.totalUnitCount > 0 ? progress.totalUnitCount : nil,
+                                bytesPerSecond: speed
+                            )
+                            self.updateState(for: modelId, to: .downloading(dp))
+                            continuation.yield(dp)
+                        }
+                        self.updateState(for: modelId, to: .downloaded)
+                        continuation.finish()
+                    } catch {
+                        self.updateState(for: modelId, to: .notDownloaded)
+                        continuation.finish()
+                    }
+                    self.inFlightDownloads.withLock { $0[modelId] = nil }
+                }
+
+                inFlightDownloads.withLock { $0[modelId] = task }
+
+                continuation.onTermination = { [weak self] _ in
+                    self?.inFlightDownloads.withLock { downloads in
+                        downloads[modelId]?.cancel()
+                        downloads[modelId] = nil
+                    }
+                }
+            }
+        }
+
+        // MARK: - Delete
+
+        /// Removes downloaded model files from disk and resets state.
+        ///
+        /// Also cancels any in-flight download and evicts the model from
+        /// the in-memory model cache.
+        public func deleteDownload(modelId: String, hub: HubApi = HubApi()) async throws {
+            // Cancel in-flight download
+            inFlightDownloads.withLock { downloads in
+                downloads[modelId]?.cancel()
+                downloads[modelId] = nil
+            }
+
+            // Remove from in-memory model cache
+            let cacheModel = MLXLanguageModel(modelId: modelId, hub: hub)
+            await cacheModel.removeFromCache()
+
+            // Delete files on disk
+            let repo = Hub.Repo(id: modelId)
+            let repoDir = hub.localRepoLocation(repo)
+            if FileManager.default.fileExists(atPath: repoDir.path) {
+                try FileManager.default.removeItem(at: repoDir)
+            }
+
+            updateState(for: modelId, to: .notDownloaded)
+        }
+
+        // MARK: - Disk Size
+
+        /// Returns the total size of the downloaded model on disk, in bytes.
+        public func downloadedSize(for modelId: String, hub: HubApi = HubApi()) -> Int64? {
+            let repo = Hub.Repo(id: modelId)
+            let repoDir = hub.localRepoLocation(repo)
+            guard FileManager.default.fileExists(atPath: repoDir.path) else { return nil }
+            return Self.directorySize(at: repoDir)
+        }
+
+        static func directorySize(at url: URL) -> Int64 {
+            let fm = FileManager.default
+            guard let enumerator = fm.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else { return 0 }
+
+            var totalSize: Int64 = 0
+            for case let fileURL as URL in enumerator {
+                guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey]),
+                      values.isDirectory != true,
+                      let size = values.fileSize
+                else { continue }
+                totalSize += Int64(size)
+            }
+            return totalSize
+        }
+    }
+
+    // MARK: - DownloadableLanguageModel Conformance
+
+    extension MLXLanguageModel: DownloadableLanguageModel {
+        public var isDownloaded: Bool {
+            if directory != nil { return true }
+            return MLXModelDownloadManager.shared.state(for: modelId, hub: hub ?? HubApi()) == .downloaded
+        }
+
+        public var downloadState: ModelDownloadState {
+            if directory != nil { return .downloaded }
+            return MLXModelDownloadManager.shared.state(for: modelId, hub: hub ?? HubApi())
+        }
+
+        public func download() -> AsyncStream<DownloadProgress> {
+            if directory != nil {
+                return AsyncStream { $0.finish() }
+            }
+            return MLXModelDownloadManager.shared.download(modelId: modelId, hub: hub ?? HubApi())
+        }
+
+        public func deleteDownload() async throws {
+            if directory != nil { return }
+            try await MLXModelDownloadManager.shared.deleteDownload(modelId: modelId, hub: hub ?? HubApi())
+        }
+
+        public var downloadedSizeOnDisk: Int64? {
+            if directory != nil { return MLXModelDownloadManager.directorySize(at: directory!) }
+            return MLXModelDownloadManager.shared.downloadedSize(for: modelId, hub: hub ?? HubApi())
+        }
+    }
+
+    // MARK: - Hub Re-exports
+
+    /// Re-export Hub types so consumers can configure custom HubApi instances
+    /// (download location, HF token) without importing Hub directly.
+    public typealias HubRepo = Hub.Repo
+    public typealias HubRepoType = Hub.RepoType
 #endif  // MLX
