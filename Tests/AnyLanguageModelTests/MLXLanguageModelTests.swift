@@ -69,6 +69,41 @@ import Testing
             #expect(!chunks.isEmpty)
         }
 
+        @Test func multiTurnSameSession() async throws {
+            let session = LanguageModelSession(model: model)
+            let first = try await session.respond(to: "Say hello in one sentence.")
+            #expect(!first.content.isEmpty)
+
+            let second = try await session.respond(to: "Now answer with one more short sentence.")
+            #expect(!second.content.isEmpty)
+        }
+
+        @Test func rejectsConcurrentRequestsForSameSession() async throws {
+            let session = LanguageModelSession(model: model)
+            let stream = session.streamResponse(
+                to: "Count from 1 to 400 with one number per line.",
+                options: .init(maximumResponseTokens: 256)
+            )
+
+            do {
+                _ = try await session.respond(to: "This concurrent request should fail.")
+                Issue.record("Expected concurrent request to throw.")
+            } catch let error as LanguageModelSession.GenerationError {
+                switch error {
+                case .concurrentRequests:
+                    break
+                default:
+                    Issue.record("Expected .concurrentRequests, got \(error)")
+                }
+            } catch {
+                Issue.record("Expected GenerationError.concurrentRequests, got \(error)")
+            }
+
+            for try await _ in stream {
+                break
+            }
+        }
+
         @Test func withGenerationOptions() async throws {
             let session = LanguageModelSession(model: model)
 
@@ -119,7 +154,11 @@ import Testing
                 )
             ])
             let session = LanguageModelSession(model: visionModel, transcript: transcript)
-            let response = try await session.respond(to: "")
+            var options = GenerationOptions()
+            var mlxOptions = MLXLanguageModel.CustomGenerationOptions.default
+            mlxOptions.userInputProcessing = .resize(to: CGSize(width: 512, height: 512))
+            options[custom: MLXLanguageModel.self] = mlxOptions
+            let response = try await session.respond(to: "", options: options)
             #expect(!response.content.isEmpty)
         }
 
@@ -133,7 +172,11 @@ import Testing
                 )
             ])
             let session = LanguageModelSession(model: visionModel, transcript: transcript)
-            let response = try await session.respond(to: "")
+            var options = GenerationOptions()
+            var mlxOptions = MLXLanguageModel.CustomGenerationOptions.default
+            mlxOptions.userInputProcessing = .resize(to: CGSize(width: 512, height: 512))
+            options[custom: MLXLanguageModel.self] = mlxOptions
+            let response = try await session.respond(to: "", options: options)
             #expect(!response.content.isEmpty)
         }
 
@@ -220,6 +263,28 @@ import Testing
             #expect([Priority.low, Priority.medium, Priority.high].contains(response.content))
         }
 
+        @Test func withAdditionalContext() async throws {
+            let session = LanguageModelSession(model: model)
+
+            var options = GenerationOptions(
+                temperature: 0.7,
+                maximumResponseTokens: 32
+            )
+            var custom = MLXLanguageModel.CustomGenerationOptions.default
+            custom.additionalContext = [
+                "user_name": JSONValue.string("Alice"),
+                "turn_count": JSONValue.int(3),
+                "verbose": JSONValue.bool(true),
+            ]
+            options[custom: MLXLanguageModel.self] = custom
+
+            let response = try await session.respond(
+                to: "Say hello",
+                options: options
+            )
+            #expect(!response.content.isEmpty)
+        }
+
         @Test func unavailableForNonexistentModel() async {
             let model = MLXLanguageModel(modelId: "mlx-community/does-not-exist-anylanguagemodel-test")
             await model.removeFromCache()
@@ -238,6 +303,13 @@ import Testing
                 Issue.record("Expected model availability to report failedToLoad after failed request")
             }
             #expect(model.isAvailable == false)
+        }
+
+        @Test func removeAllFromCacheThenRespond() async throws {
+            await MLXLanguageModel.removeAllFromCache()
+            let session = LanguageModelSession(model: model)
+            let response = try await session.respond(to: "Say hello after cache clear")
+            #expect(!response.content.isEmpty)
         }
     }
 #endif  // MLX

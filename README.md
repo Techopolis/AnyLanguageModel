@@ -90,7 +90,7 @@ session.toolExecutionDelegate = ToolExecutionObserver()
 > when targeting macOS 15 / iOS 18 or earlier
 > (e.g. `Conformance of 'String' to 'Generable' is only available in macOS 26.0 or newer`).
 > As a workaround, build your project with Xcode 16.
-> For more information, see [issue #15](https://github.com/mattt/AnyLanguageModel/issues/15).
+> For more information, see [issue #15](https://github.com/huggingface/AnyLanguageModel/issues/15).
 
 ## Installation
 
@@ -98,7 +98,7 @@ Add this package to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/mattt/AnyLanguageModel", from: "0.7.0")
+    .package(url: "https://github.com/huggingface/AnyLanguageModel", from: "0.8.0")
 ]
 ```
 
@@ -125,8 +125,8 @@ To enable specific traits, specify them in your package's dependencies:
 // In your Package.swift
 dependencies: [
     .package(
-        url: "https://github.com/mattt/AnyLanguageModel.git",
-        from: "0.7.0",
+        url: "https://github.com/huggingface/AnyLanguageModel.git",
+        from: "0.8.0",
         traits: ["CoreML", "MLX"] // Enable CoreML and MLX support
     )
 ]
@@ -142,8 +142,8 @@ dependencies: [
 > ```swift
 > dependencies: [
 >     .package(
->         url: "https://github.com/mattt/AnyLanguageModel.git",
->         from: "0.7.0",
+>         url: "https://github.com/huggingface/AnyLanguageModel.git",
+>         from: "0.8.0",
 >         traits: ["CoreML", "MLX", "Llama"]
 >     ),
 >     .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"), // CoreML
@@ -153,7 +153,7 @@ dependencies: [
 > ```
 >
 > Include only the dependencies that correspond to the traits you enable.
-> For more information, see [issue #135](https://github.com/mattt/AnyLanguageModel/issues/135).
+> For more information, see [issue #135](https://github.com/huggingface/AnyLanguageModel/issues/135).
 
 ### Using Traits in Xcode Projects
 
@@ -197,7 +197,7 @@ let package = Package(
     ],
     dependencies: [
         .package(
-            url: "https://github.com/mattt/AnyLanguageModel",
+            url: "https://github.com/huggingface/AnyLanguageModel",
             from: "0.4.0",
             traits: ["MLX"]
         )
@@ -468,8 +468,8 @@ Enable the trait in Package.swift:
 
 ```swift
 .package(
-    url: "https://github.com/mattt/AnyLanguageModel.git",
-    branch: "main",
+    url: "https://github.com/huggingface/AnyLanguageModel.git",
+    from: "0.8.0",
     traits: ["CoreML"]
 )
 ```
@@ -486,6 +486,52 @@ let session = LanguageModelSession(model: model)
 let response = try await session.respond {
     Prompt("What is the capital of France?")
 }
+```
+
+You can tune MLX request behavior per call with model-specific options,
+including KV-cache settings and optional media preprocessing:
+
+```swift
+var options = GenerationOptions(temperature: 0.7)
+var mlxOptions = MLXLanguageModel.CustomGenerationOptions.default
+mlxOptions.kvCache = .init(
+    maxSize: 4096,
+    bits: 4,
+    groupSize: 64,
+    quantizedStart: 128
+)
+// Apply a deterministic preprocessing step for image inputs.
+mlxOptions.userInputProcessing = .resize(to: CGSize(width: 512, height: 512))
+// Inject extra template context consumed by model-specific chat templates.
+mlxOptions.additionalContext = [
+    "user_name": .string("Alice"),
+    "turn_count": .int(3),
+    "verbose": .bool(true),
+]
+options[custom: MLXLanguageModel.self] = mlxOptions
+
+let response = try await session.respond(
+    to: "Summarize this transcript",
+    options: options
+)
+```
+
+You can specify `userInputProcessing` to enforce a consistent image
+preprocessing step
+(for example, fixed dimensions for predictable latency, memory usage, and vision behavior).
+By default, images are passed through without an explicit resize override
+(`resize: nil`), so MLX applies its default media processing behavior.
+
+You can also set `additionalContext` to provide extra JSON template variables
+for model-specific chat templates.
+
+GPU cache behavior can be configured when creating the model:
+
+```swift
+let model = MLXLanguageModel(
+    modelId: "mlx-community/Qwen3-0.6B-4bit",
+    gpuMemory: .automatic
+)
 ```
 
 Vision support depends on the specific MLX model you load.
@@ -508,8 +554,8 @@ Enable the trait in Package.swift:
 
 ```swift
 .package(
-    url: "https://github.com/mattt/AnyLanguageModel.git",
-    branch: "main",
+    url: "https://github.com/huggingface/AnyLanguageModel.git",
+    from: "0.8.0",
     traits: ["MLX"]
 )
 ```
@@ -532,8 +578,8 @@ Enable the trait in Package.swift:
 
 ```swift
 .package(
-    url: "https://github.com/mattt/AnyLanguageModel.git",
-    branch: "main",
+    url: "https://github.com/huggingface/AnyLanguageModel.git",
+    from: "0.8.0",
     traits: ["Llama"]
 )
 ```
@@ -888,7 +934,18 @@ swift test --traits CoreML,Llama
 >   -only-testing:AnyLanguageModelTests/MLXLanguageModelTests
 > ```
 
+## Contributing
+
+This is a community project and we welcome contributions.
+Please check out
+[Issues tagged with `good first issue`][good-first-issues]
+if you are looking for a place to start!
+
+Please ensure your code passes the build and test suite
+before submitting a pull request.
+
+[good-first-issues]: https://github.com/huggingface/AnyLanguageModel/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22
+
 ## License
 
-This project is available under the MIT license.
-See the LICENSE file for more info.
+[Apache 2](LICENSE).
