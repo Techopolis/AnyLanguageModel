@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_Start_Testing__list_organizations",
+      "Read(//tmp/**)",
+      "Bash(grep -n '=======$\\\\|>>>>>>> ' /Users/mikedoise/Developer/AnyLanguageModel/Sources/AnyLanguageModel/Models/MLXLanguageModel.swift /Users/mikedoise/Developer/AnyLanguageModel/Package.resolved)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(swift build:*)",
+      "Bash(xcodebuild -workspace \"Perspective Intelligence.xcworkspace\" -scheme \"Perspective Intelligence\" -destination \"generic/platform=iOS\" -quiet build)",
+      "Bash(xcodebuild -workspace \"Perspective Intelligence.xcworkspace\" -list)",
+      "Bash(xcodebuild -project \"Perspective Intelligence.xcodeproj\" -scheme \"Perspective Intelligence\" -destination \"generic/platform=iOS\" -quiet build)"
+    ]
+  }
+}
