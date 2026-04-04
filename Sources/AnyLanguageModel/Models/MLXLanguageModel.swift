@@ -2035,7 +2035,7 @@ import Foundation
                         let repo = Hub.Repo(id: modelId)
                         try await hub.snapshot(
                             from: repo,
-                            matching: ["*.safetensors", "*.json", "tokenizer.model"]
+                            matching: ["*.safetensors", "*.json", "*.jinja", "tokenizer.model"]
                         ) { progress, speed in
                             let dp = DownloadProgress(
                                 fractionCompleted: progress.fractionCompleted,

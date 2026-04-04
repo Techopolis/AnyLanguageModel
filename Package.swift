@@ -43,7 +43,7 @@ let package = Package(
         .package(url: "https://github.com/mattt/PartialJSONDecoder", from: "1.0.0"),
         // mlx-swift-lm >= 2.30.3 for fast SDPA, Gemma3n per-layer intermediate_size,
         // cache race fix, Memory API, and chat rehydration. >= 2.25.5 for ToolSpec/tool calls.
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "2.30.3"),
+        .package(path: "../mlx-swift-lm"),
         .package(url: "https://github.com/swiftlang/swift-syntax", from: "600.0.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.24.0"),
     ],

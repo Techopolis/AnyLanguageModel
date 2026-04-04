@@ -8,7 +8,20 @@
       "Bash(swift build:*)",
       "Bash(xcodebuild -workspace \"Perspective Intelligence.xcworkspace\" -scheme \"Perspective Intelligence\" -destination \"generic/platform=iOS\" -quiet build)",
       "Bash(xcodebuild -workspace \"Perspective Intelligence.xcworkspace\" -list)",
-      "Bash(xcodebuild -project \"Perspective Intelligence.xcodeproj\" -scheme \"Perspective Intelligence\" -destination \"generic/platform=iOS\" -quiet build)"
+      "Bash(xcodebuild -project \"Perspective Intelligence.xcodeproj\" -scheme \"Perspective Intelligence\" -destination \"generic/platform=iOS\" -quiet build)",
+      "Bash(chmod +x:*)",
+      "Bash(./scripts/check-upstream.sh:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(xcodebuild -project \"Perspective Intelligence.xcodeproj\" -scheme \"Perspective Intelligence\" -destination \"generic/platform=iOS\" -resolvePackageDependencies)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python3 -c \"import mlx_lm; print\\(mlx_lm.__version__\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/gemma4_text.py\" -o /tmp/gemma4_text_mlxlm.py)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/gemma4.py\" -o /tmp/gemma4_mlxlm.py)",
+      "Bash(swift run:*)",
+      "Bash(xcodebuild -scheme \"Perspective Intelligence\" -destination 'generic/platform=iOS' build)"
     ]
   }
 }
