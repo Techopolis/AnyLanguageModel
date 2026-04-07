@@ -70,6 +70,19 @@ let package = Package(
                     package: "mlx-swift-lm",
                     condition: .when(traits: ["MLX"])
                 ),
+                // Hub + Tokenizers for MLX download management and tokenizer bridging.
+                // Previously transitive via mlx-swift-lm → swift-transformers; now explicit
+                // after mlx-swift-lm decoupled from swift-transformers.
+                .product(
+                    name: "Hub",
+                    package: "swift-transformers",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "Tokenizers",
+                    package: "swift-transformers",
+                    condition: .when(traits: ["MLX"])
+                ),
                 .product(
                     name: "Transformers",
                     package: "swift-transformers",

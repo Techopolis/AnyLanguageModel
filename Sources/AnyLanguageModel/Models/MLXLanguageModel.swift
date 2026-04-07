@@ -19,6 +19,80 @@ import Foundation
     import Hub
     import Observation
 
+    // MARK: - Bridge Types (HubApi → MLXLMCommon.Downloader / TokenizerLoader)
+
+    /// Wraps swift-transformers' `HubApi` to conform to `MLXLMCommon.Downloader`.
+    private struct HubApiDownloader: MLXLMCommon.Downloader {
+        let hubApi: HubApi
+
+        func download(
+            id: String,
+            revision: String?,
+            matching patterns: [String],
+            useLatest: Bool,
+            progressHandler: @Sendable @escaping (Progress) -> Void
+        ) async throws -> URL {
+            let repo = Hub.Repo(id: id)
+            return try await hubApi.snapshot(
+                from: repo,
+                matching: patterns
+            ) { progress, _ in
+                progressHandler(progress)
+            }
+        }
+    }
+
+    /// Wraps swift-transformers' `Tokenizers.Tokenizer` to conform to `MLXLMCommon.Tokenizer`.
+    private struct TokenizerBridge: MLXLMCommon.Tokenizer {
+        private let upstream: any Tokenizers.Tokenizer
+
+        init(_ upstream: any Tokenizers.Tokenizer) {
+            self.upstream = upstream
+        }
+
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+            upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
+        }
+
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+            upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
+        }
+
+        func convertTokenToId(_ token: String) -> Int? {
+            upstream.convertTokenToId(token)
+        }
+
+        func convertIdToToken(_ id: Int) -> String? {
+            upstream.convertIdToToken(id)
+        }
+
+        var bosToken: String? { upstream.bosToken }
+        var eosToken: String? { upstream.eosToken }
+        var unknownToken: String? { upstream.unknownToken }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            do {
+                return try upstream.applyChatTemplate(
+                    messages: messages, tools: tools, additionalContext: additionalContext)
+            } catch Tokenizers.TokenizerError.missingChatTemplate {
+                throw MLXLMCommon.TokenizerError.missingChatTemplate
+            }
+        }
+    }
+
+    /// Loads tokenizers from local directories using swift-transformers' `AutoTokenizer`,
+    /// then bridges the result to `MLXLMCommon.Tokenizer`.
+    private struct HubTokenizerLoader: MLXLMCommon.TokenizerLoader {
+        func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+            let upstream = try await AutoTokenizer.from(modelFolder: directory)
+            return TokenizerBridge(upstream)
+        }
+    }
+
     /// Wrapper to store model availability state in NSCache.
     private final class CachedModelState: NSObject, @unchecked Sendable {
         enum Value {
@@ -614,9 +688,6 @@ import Foundation
         /// The model identifier.
         public let modelId: String
 
-        /// The Hub API instance for downloading models.
-        public let hub: HubApi?
-
         /// The local directory containing the model files.
         public let directory: URL?
 
@@ -627,17 +698,14 @@ import Foundation
         ///
         /// - Parameters:
         ///   - modelId: The model identifier (for example, "mlx-community/Llama-3.2-3B-Instruct-4bit").
-        ///   - hub: An optional Hub API instance for downloading models. If not provided, the default Hub API is used.
         ///   - directory: An optional local directory URL containing the model files. If provided, the model is loaded from this directory instead of downloading.
         ///   - gpuMemory: The GPU-memory behavior used for this model's active and idle phases.
         public init(
             modelId: String,
-            hub: HubApi? = nil,
             directory: URL? = nil,
             gpuMemory: GPUMemoryConfiguration = .automatic
         ) {
             self.modelId = modelId
-            self.hub = hub
             self.directory = directory
             self.gpuMemory = gpuMemory
             GPUMemoryManager.shared.register(gpuMemory)
@@ -676,16 +744,19 @@ import Foundation
         }
 
         /// Get or load model context with caching
-        private func loadContext(modelId: String, hub: HubApi?, directory: URL?) async throws -> ModelContext {
+        private func loadContext(modelId: String, directory: URL?) async throws -> ModelContext {
             let key = directory?.absoluteString ?? modelId
+            let tokenizerLoader = HubTokenizerLoader()
 
             return try await modelCache.context(for: key) {
                 if let directory {
-                    return try await loadModel(directory: directory)
+                    return try await loadModel(from: directory, using: tokenizerLoader)
                 }
 
-                let effectiveHub = hub ?? HubApi()
-                let context = try await loadModel(hub: effectiveHub, id: modelId) { progress in
+                let downloader = HubApiDownloader(hubApi: HubApi())
+                let context = try await loadModel(
+                    from: downloader, using: tokenizerLoader, id: modelId
+                ) { progress in
                     let dp = DownloadProgress(
                         fractionCompleted: progress.fractionCompleted,
                         completedBytes: progress.completedUnitCount,
@@ -883,7 +954,7 @@ import Foundation
             defer { Self.releaseGenerationSlot(for: session) }
 
             // Get cached or load fresh ModelContext
-            let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+            let context = try await loadContext(modelId: modelId, directory: directory)
             let generationScope = beginGenerationScope()
             defer { endGenerationScope(generationScope) }
 
@@ -1068,7 +1139,6 @@ import Foundation
             }
 
             let modelId = self.modelId
-            let hub = self.hub
             let directory = self.directory
             let gpuMemory = self.gpuMemory
 
@@ -1099,7 +1169,7 @@ import Foundation
 
                     do {
                         // Get cached or load fresh ModelContext
-                        let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+                        let context = try await loadContext(modelId: modelId, directory: directory)
 
                         // Build chat inside task to avoid Sendable issues
                         let generateParameters = toGenerateParameters(options)
@@ -1198,7 +1268,6 @@ import Foundation
             tools: [any Tool]? = nil
         ) {
             let modelId = self.modelId
-            let hub = self.hub
             let directory = self.directory
 
             Task {
@@ -1211,7 +1280,7 @@ import Foundation
                 defer { endGenerationScope(generationScope) }
 
                 do {
-                    let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+                    let context = try await loadContext(modelId: modelId, directory: directory)
                     guard let instructions = session.instructions?.description, !instructions.isEmpty else {
                         return
                     }
@@ -1756,7 +1825,7 @@ import Foundation
 
     private struct MLXTokenBackend: TokenBackend {
         let model: any MLXLMCommon.LanguageModel
-        let tokenizer: any Tokenizer
+        let tokenizer: any MLXLMCommon.Tokenizer
         var state: MLXLMCommon.LMOutput.State?
         var cache: [MLXLMCommon.KVCache]
         var processor: MLXLMCommon.LogitProcessor?
@@ -1837,7 +1906,7 @@ import Foundation
 
         private static func buildEndTokens(
             eosTokenId: Int,
-            tokenizer: any Tokenizer,
+            tokenizer: any MLXLMCommon.Tokenizer,
             configuration: ModelConfiguration
         ) -> Set<Int> {
             var tokens: Set<Int> = [eosTokenId]
@@ -1857,14 +1926,14 @@ import Foundation
         }
 
         func isSpecialToken(_ token: Int) -> Bool {
-            // Use swift-transformers' own special token registry (skipSpecialTokens) instead of guessing.
-            let raw = tokenizer.decode(tokens: [token], skipSpecialTokens: false)
+            // Use the tokenizer's own special token registry (skipSpecialTokens) instead of guessing.
+            let raw = tokenizer.decode(tokenIds: [token], skipSpecialTokens: false)
             guard !raw.isEmpty else { return false }
-            let filtered = tokenizer.decode(tokens: [token], skipSpecialTokens: true)
+            let filtered = tokenizer.decode(tokenIds: [token], skipSpecialTokens: true)
             return filtered.isEmpty
         }
 
-        private static func buildTokensExcludedFromRepetitionPenalty(tokenizer: any Tokenizer) -> Set<Int> {
+        private static func buildTokensExcludedFromRepetitionPenalty(tokenizer: any MLXLMCommon.Tokenizer) -> Set<Int> {
             let excludedTexts = ["{", "}", "[", "]", ",", ":", "\""]
             var excluded = Set<Int>()
             excluded.reserveCapacity(excludedTexts.count * 2)
@@ -1884,7 +1953,7 @@ import Foundation
         }
 
         func tokenText(_ token: Int) -> String? {
-            let decoded = tokenizer.decode(tokens: [token], skipSpecialTokens: false)
+            let decoded = tokenizer.decode(tokenIds: [token], skipSpecialTokens: false)
             return decoded.isEmpty ? nil : decoded
         }
 
@@ -1966,7 +2035,7 @@ import Foundation
         /// Returns the current download state for a model.
         ///
         /// On first access for a given model, checks disk for existing files.
-        public func state(for modelId: String, hub: HubApi = HubApi()) -> ModelDownloadState {
+        public func state(for modelId: String) -> ModelDownloadState {
             stateLock.lock()
             if let cached = states[modelId] {
                 stateLock.unlock()
@@ -1974,7 +2043,8 @@ import Foundation
             }
             stateLock.unlock()
 
-            // Check disk
+            // Check disk using HubApi cache location
+            let hub = HubApi()
             let repo = Hub.Repo(id: modelId)
             let repoDir = hub.localRepoLocation(repo)
             let configPath = repoDir.appendingPathComponent("config.json")
@@ -2019,8 +2089,8 @@ import Foundation
         /// If the model is already downloaded, the stream completes immediately.
         /// Cancelling the consuming `Task` cancels the download (snapshot checks
         /// `Task.isCancelled` between files).
-        public func download(modelId: String, hub: HubApi = HubApi()) -> AsyncStream<DownloadProgress> {
-            let currentState = state(for: modelId, hub: hub)
+        public func download(modelId: String) -> AsyncStream<DownloadProgress> {
+            let currentState = state(for: modelId)
             if case .downloaded = currentState {
                 return AsyncStream { $0.finish() }
             }
@@ -2032,6 +2102,7 @@ import Foundation
                         return
                     }
                     do {
+                        let hub = HubApi()
                         let repo = Hub.Repo(id: modelId)
                         try await hub.snapshot(
                             from: repo,
@@ -2072,7 +2143,7 @@ import Foundation
         ///
         /// Also cancels any in-flight download and evicts the model from
         /// the in-memory model cache.
-        public func deleteDownload(modelId: String, hub: HubApi = HubApi()) async throws {
+        public func deleteDownload(modelId: String) async throws {
             // Cancel in-flight download
             inFlightDownloads.withLock { downloads in
                 downloads[modelId]?.cancel()
@@ -2080,10 +2151,11 @@ import Foundation
             }
 
             // Remove from in-memory model cache
-            let cacheModel = MLXLanguageModel(modelId: modelId, hub: hub)
+            let cacheModel = MLXLanguageModel(modelId: modelId)
             await cacheModel.removeFromCache()
 
             // Delete files on disk
+            let hub = HubApi()
             let repo = Hub.Repo(id: modelId)
             let repoDir = hub.localRepoLocation(repo)
             if FileManager.default.fileExists(atPath: repoDir.path) {
@@ -2096,7 +2168,8 @@ import Foundation
         // MARK: - Disk Size
 
         /// Returns the total size of the downloaded model on disk, in bytes.
-        public func downloadedSize(for modelId: String, hub: HubApi = HubApi()) -> Int64? {
+        public func downloadedSize(for modelId: String) -> Int64? {
+            let hub = HubApi()
             let repo = Hub.Repo(id: modelId)
             let repoDir = hub.localRepoLocation(repo)
             guard FileManager.default.fileExists(atPath: repoDir.path) else { return nil }
@@ -2128,36 +2201,36 @@ import Foundation
     extension MLXLanguageModel: DownloadableLanguageModel {
         public var isDownloaded: Bool {
             if directory != nil { return true }
-            return MLXModelDownloadManager.shared.state(for: modelId, hub: hub ?? HubApi()) == .downloaded
+            return MLXModelDownloadManager.shared.state(for: modelId) == .downloaded
         }
 
         public var downloadState: ModelDownloadState {
             if directory != nil { return .downloaded }
-            return MLXModelDownloadManager.shared.state(for: modelId, hub: hub ?? HubApi())
+            return MLXModelDownloadManager.shared.state(for: modelId)
         }
 
         public func download() -> AsyncStream<DownloadProgress> {
             if directory != nil {
                 return AsyncStream { $0.finish() }
             }
-            return MLXModelDownloadManager.shared.download(modelId: modelId, hub: hub ?? HubApi())
+            return MLXModelDownloadManager.shared.download(modelId: modelId)
         }
 
         public func deleteDownload() async throws {
             if directory != nil { return }
-            try await MLXModelDownloadManager.shared.deleteDownload(modelId: modelId, hub: hub ?? HubApi())
+            try await MLXModelDownloadManager.shared.deleteDownload(modelId: modelId)
         }
 
         public var downloadedSizeOnDisk: Int64? {
             if directory != nil { return MLXModelDownloadManager.directorySize(at: directory!) }
-            return MLXModelDownloadManager.shared.downloadedSize(for: modelId, hub: hub ?? HubApi())
+            return MLXModelDownloadManager.shared.downloadedSize(for: modelId)
         }
     }
 
-    // MARK: - Hub Re-exports
+    // MARK: - Hub Re-exports (legacy, kept for source compatibility)
 
-    /// Re-export Hub types so consumers can configure custom HubApi instances
-    /// (download location, HF token) without importing Hub directly.
+    @available(*, deprecated, message: "HubApi is no longer exposed in the public API")
     public typealias HubRepo = Hub.Repo
+    @available(*, deprecated, message: "HubApi is no longer exposed in the public API")
     public typealias HubRepoType = Hub.RepoType
 #endif  // MLX
